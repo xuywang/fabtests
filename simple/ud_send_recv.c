@@ -46,18 +46,24 @@
 #include <rdma/fi_cm.h>
 #include <shared.h>
 
+#define MAX_IOV		6
+#define RING_SIZE	2
+
 static int custom;
 static int size_option;
 static int iterations = 1000;
-static int transfer_size = 1000;
-static int max_credits = 128;
-static int credits = 128;
+static int transfer_size = 128;
+static int iov_count = 2;
+static int max_credits = RING_SIZE;
+static int credits = RING_SIZE;
 static char test_name[10] = "custom";
 static struct timespec start, end;
 static void *buf;
 static void *buf_ptr;
 static size_t buffer_size;
 static size_t prefix_len;
+static void *iov_buf[MAX_IOV];
+static size_t iovbuf_size;
 static size_t max_msg_size = 0;
 static int machr, g_argc;
 static char **g_argv;
@@ -70,12 +76,12 @@ static char *dst_addr, *src_addr;
 static char *port = "3333";
 static fi_addr_t rem_addr;
 
-static struct fi_info *fi;
 static struct fid_fabric *fab;
 static struct fid_domain *dom;
 static struct fid_ep *ep;
 static struct fid_cq *rcq, *scq;
 static struct fid_mr *mr;
+static struct fid_mr *iov_mr[MAX_IOV];
 static struct fid_av *av;
 
 static int poll_all_sends(void)
@@ -120,6 +126,7 @@ post:
 	return ret;
 }
 
+/*
 static int recv_xfer(int size)
 {
 	struct fi_cq_entry comp;
@@ -129,11 +136,10 @@ static int recv_xfer(int size)
 	do {
 		ret = fi_cq_read(rcq, &comp, sizeof comp);
 		if (ret < 0) {
-	//		printf("rcq read %d (%s)\n", ret, fi_strerror(-ret));
 			fi_cq_readerr(rcq, &err, 0);
-			printf("rcq read (%s) provider error code: %d\n",
-				fi_strerror(err.err),
-				err.prov_errno);
+			printf("rcq read err %d, (%s)\n", err.prov_errno,
+				fi_strerror(err.prov_errno));
+			printf("rcq read (%s)\n", fi_strerror(err.prov_errno));
 			return ret;
 		}
 	} while (!ret);
@@ -144,19 +150,195 @@ static int recv_xfer(int size)
 
 	return ret;
 }
+*/
 
-static int sync_test(void)
+static int poll_sendv()
+{
+	struct fi_cq_entry comp;
+	struct fi_cq_err_entry err;
+	int i;
+	int ret;
+
+	for (i = 0; i < max_credits; i++) {
+		do {
+			ret = fi_cq_read(scq, &comp, 1);
+			if (ret < 0) {
+				fi_cq_readerr(rcq, &err, 0);
+				printf("scq read err (%s) provider error code: %d index %d\n",
+					fi_strerror(err.err),
+					err.prov_errno,
+					i);
+				return ret;
+			}
+		} while (ret == 0);
+	}
+
+	return 0;
+}
+
+static int post_sendv(int size)
+{
+	struct iovec iov[MAX_IOV];
+	int i, j;
+	int ret;
+
+	for (i = 0; i < max_credits; i++) {
+		for (j = 0; j < iov_count; j++) {
+			iov[j].iov_base = iov_buf[j] + i * iovbuf_size;
+			iov[j].iov_len = size;
+		}
+		ret = fi_sendv(ep, iov, NULL, iov_count, rem_addr, NULL);
+		if (ret) {
+			printf("fi_sendv %d (%s)\n", ret, fi_strerror(-ret));
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int poll_recvv()
+{
+	int i;
+	struct fi_cq_entry comp;
+	struct fi_cq_err_entry err;
+	int ret;
+
+	for (i = 0; i < max_credits; i++) {
+		do {
+			ret = fi_cq_read(rcq, &comp, 1);
+			if (ret < 0) {
+				fi_cq_readerr(rcq, &err, 0);
+				printf("rcq read err (%s) provider error code: %d index %d\n",
+					fi_strerror(err.err),
+					err.prov_errno,
+					i);
+				return ret;
+			}
+		} while (!ret);
+	}
+
+	return 0;
+}
+
+#if 0
+static int recvv_xfer(int size)
+{
+/*	struct iovec iov[MAX_IOV]; */
+	int i; //, j;
+	int ret;
+
+	for (i = 0; i < max_credits; i++) {
+		do {
+			ret = fi_cq_read(rcq, &comp, sizeof comp);
+			if (ret < 0) {
+				fi_cq_readerr(rcq, &err, 0);
+				printf("rcq read err %d, (%s)\n", err.prov_errno,
+					fi_strerror(err.prov_errno));
+				return ret;
+			}
+		} while (!ret);
+		printf("Finished polling recv queue, packet id %d\n", i);
+
+/*
+		for (j = 0; j < iov_count; j++) {
+			iov[j].iov_base = iov_buf[j] + i * iovbuf_size;
+			iov[j].iov_len = size;
+		}
+		ret = fi_recvv(ep, iov, NULL, iov_count, 0, NULL);
+		if (ret) {
+			printf("fi_recvv %d (%s)\n", ret, fi_strerror(-ret));
+			return ret;
+		}
+*/
+		ret = fi_recv(ep, buf, iov_count * size + prefix_len, fi_mr_desc(mr), 0, buf);
+		if (ret) {
+			printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
+			return ret;
+		}
+		printf ("Post one recv packet index %d \n", i);
+	}
+
+	return ret;
+}
+#endif /* 0 */
+
+static int post_recvv(int size)
+{
+	struct iovec iov[MAX_IOV];
+	int i;
+	int j;
+	int ret;
+
+	for (i = 0; i < max_credits; i++) {
+		for (j = 0; j < iov_count; j++) {
+			iov[j].iov_base = iov_buf[j] + i * iovbuf_size;
+			if (j == 0)
+				iov[j].iov_len = size + prefix_len;
+			else
+				iov[j].iov_len = size;
+		}
+		ret = fi_recvv(ep, iov, NULL, iov_count, 0, NULL);
+		if (ret) {
+			printf("fi_recvv %d (%s)\n", ret, fi_strerror(-ret));
+			return ret;
+		}
+/*
+		ret = fi_recv(ep, buf, iov_count * size + prefix_len, fi_mr_desc(mr), 0, buf);
+		if (ret) {
+			printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
+			return ret;
+		}
+*/
+	}
+	return ret;
+}
+
+static int client_xferv(int size)
 {
 	int ret;
 
-	while (credits < max_credits)
-		poll_all_sends();
-
-	ret = dst_addr ? send_xfer(16) : recv_xfer(16);
+	ret = post_sendv(size);
+	if (ret)
+		return ret;
+	ret = poll_sendv();
+	if (ret)
+		return ret;
+	ret = poll_recvv();
+	if (ret)
+		return ret;
+	ret = post_recvv(size);
 	if (ret)
 		return ret;
 
-	return dst_addr ? recv_xfer(16) : send_xfer(16);
+	return 0;
+}
+
+static int server_xferv(int size)
+{
+	int ret;
+
+	ret = poll_recvv();
+	if (ret)
+		return ret;
+	ret = post_recvv(size);
+	if (ret)
+		return ret;
+	ret = post_sendv(size);
+	if (ret)
+		return ret;
+	ret = poll_sendv();
+	if (ret)
+		return ret;
+	return 0;
+}
+
+static int sync_test(void)
+{
+	while (credits < max_credits)
+		poll_all_sends();
+
+	return 0;
 }
 
 static int run_test(void)
@@ -167,15 +349,36 @@ static int run_test(void)
 	if (ret)
 		return ret;
 
+	ret = post_recvv(transfer_size);
+	if (ret)
+		return ret;
+	sleep(1);
 	clock_gettime(CLOCK_MONOTONIC, &start);
-	for (i = 0; i < iterations; i++) {
-		ret = dst_addr ? send_xfer(transfer_size) :
-				 recv_xfer(transfer_size);
+	for (i = 0; i < iterations - 1; i++) {
+		ret = dst_addr ? client_xferv(transfer_size) :
+				server_xferv(transfer_size);
 		if (ret)
 			return ret;
-
-		ret = dst_addr ? recv_xfer(transfer_size) :
-				 send_xfer(transfer_size);
+	}
+	if (dst_addr) {
+		ret = post_sendv(transfer_size);
+		if (ret)
+			return ret;
+		ret = poll_sendv();
+		if (ret)
+			return ret;
+		ret = poll_recvv();
+		if (ret)
+			return ret;
+	}
+	else {
+		ret = poll_recvv();
+		if (ret)
+			return ret;
+		ret = post_sendv(transfer_size);
+		if (ret)
+			return ret;
+		ret = poll_sendv();
 		if (ret)
 			return ret;
 	}
@@ -192,7 +395,7 @@ static int run_test(void)
 static void free_ep_res(void)
 {
 	int ret;
-	
+
 	ret = fi_close(&mr->fid);
 	if (ret != 0) {
 		printf("fi_close(mr) ret=%d, %s\n", ret, fi_strerror(-ret));
@@ -208,24 +411,67 @@ static void free_ep_res(void)
 	free(buf);
 }
 
+static int alloc_buf_reg_mr()
+{
+	int i;
+	void *buffer;
+	int ret;
+
+	iovbuf_size = test_size[TEST_CNT - 1].size;
+	if (max_msg_size > 0 && iovbuf_size > max_msg_size) {
+		iovbuf_size = max_msg_size;
+	}
+	iovbuf_size /= iov_count;
+	iovbuf_size += prefix_len;
+
+	buffer = calloc(iov_count, iovbuf_size * RING_SIZE);
+	if (!buffer) {
+		perror("malloc");
+		return -1;
+	}
+	for (i = 0; i < iov_count; i++) {
+		iov_buf[i] = (char*)buffer + i * iovbuf_size * RING_SIZE;
+		ret = fi_mr_reg(dom, iov_buf[i], iovbuf_size, 0, 0, 0, 0,
+					&iov_mr[i], NULL);
+		if (ret) {
+			printf("fi_mr_reg %s\n", fi_strerror(-ret));
+			goto err;
+		}
+	}
+
+	return 0;
+
+err:
+	for (i--; i >= 0; i--) {
+		fi_close(&iov_mr[i]->fid);
+	}
+	free(buffer);
+
+	return ret;
+}
+
+static void free_buf_dereg_mr()
+{
+	int i;
+
+	for (i = 0; i < iov_count; i++) {
+		fi_close(&iov_mr[i]->fid);
+	}
+	free(iov_buf[0]);
+}
+
 static int alloc_ep_res(struct fi_info *fi)
 {
 	struct fi_cq_attr cq_attr;
 	struct fi_av_attr av_attr;
 	int ret;
 
-	buffer_size = !custom ? test_size[TEST_CNT - 1].size : transfer_size;
+	buffer_size = test_size[TEST_CNT - 1].size;
 	if (max_msg_size > 0 && buffer_size > max_msg_size) {
 		buffer_size = max_msg_size;
 	}
-	if (buffer_size < fi->src_addrlen) {
-		buffer_size = fi->src_addrlen;
-	}
 	buffer_size += prefix_len;
 	buf = malloc(buffer_size);
-printf("transfer size: %d, buffer size: %zu, prefix len: %zu, addr len: %zu\n",
-	transfer_size, buffer_size, prefix_len, fi->src_addrlen);
-
 	if (!buf) {
 		perror("malloc");
 		return -1;
@@ -254,18 +500,24 @@ printf("transfer size: %d, buffer size: %zu, prefix len: %zu, addr len: %zu\n",
 		goto err3;
 	}
 
-	memset(&av_attr, 0, sizeof(av_attr));
+	ret = alloc_buf_reg_mr();
+	if (ret) {
+		goto err4;
+	}
+
 	av_attr.type = FI_AV_MAP;
 	av_attr.name = NULL;
 	av_attr.flags = 0;
 	ret = fi_av_open(dom, &av_attr, &av, NULL);
 	if (ret) {
 		printf("fi_av_open %s\n", fi_strerror(-ret));
-		goto err4;
+		goto err5;
 	}
 
 	return 0;
 
+err5:
+	free_buf_dereg_mr();
 err4:
 	fi_close(&mr->fid);
 err3:
@@ -305,17 +557,18 @@ static int bind_ep_res(void)
 		return ret;
 	}
 
+/*
 	ret = fi_recv(ep, buf, buffer_size, fi_mr_desc(mr), 0, buf);
 	if (ret) {
 		printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
 	}
-
+*/
 	return ret;
 }
 
-
 static int common_setup(void)
 {
+	struct fi_info *fi;
 	int ret;
 
 	ret = getaddr(src_addr, port, (struct sockaddr **) &hints.src_addr,
@@ -332,6 +585,20 @@ static int common_setup(void)
 		max_msg_size = fi->ep_attr->max_msg_size;
 	}
 
+	/* Each sendv may consume (1 + iov_count) send queue element */
+	if (fi->tx_attr->size < max_credits * (1 + iov_count)) {
+		printf("send queue ring size %zu is too small\n",
+			fi->tx_attr->size);
+		goto err1;
+	}
+
+	if (fi->rx_attr->size < max_credits * (1 + iov_count)) {
+		printf("recv queue ring size %zu is too small\n",
+			fi->rx_attr->size);
+		goto err1;
+	}
+
+	ret = fi_fabric(fi->fabric_attr, &fab, NULL);
 	ret = fi_fabric(fi->fabric_attr, &fab, NULL);
 	if (ret) {
 		printf("fi_fabric %s\n", fi_strerror(-ret));
@@ -349,7 +616,7 @@ static int common_setup(void)
 	}
 
 	if (fi->src_addr != NULL) {
-		((struct sockaddr_in *)fi->src_addr)->sin_port = 
+		((struct sockaddr_in *)fi->src_addr)->sin_port =
 			((struct sockaddr_in *)hints.src_addr)->sin_port;
 
 		if (dst_addr == NULL) {
@@ -379,6 +646,7 @@ static int common_setup(void)
 
 	if (hints.src_addr)
 		free(hints.src_addr);
+	fi_freeinfo(fi);
 	return 0;
 
 err5:
@@ -418,17 +686,25 @@ static int client_connect(void)
 		goto err;
 	}
 
-	// send initial message to server with our local address
-	memcpy(buf_ptr, fi->src_addr, fi->src_addrlen);
-	ret = send_xfer(fi->src_addrlen);
+	ret = fi_recv(ep, buf, buffer_size, fi_mr_desc(mr), 0, buf);
+	if (ret) {
+		printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
+		goto err;
+	}
+
+	// send initial message to server
+	ret = send_xfer(4);
 	if (ret != 0)
 		goto err;
 
 
 	// wait for reply to know server is ready
+/*
 	ret = recv_xfer(4);
 	if (ret != 0)
 		goto err;
+*/
+	wait_for_completion(rcq, 1);
 
 	return 0;
 
@@ -450,31 +726,32 @@ static int server_connect(void)
 	if (ret != 0)
 		goto err;
 
+	ret = fi_recv(ep, buf, buffer_size, fi_mr_desc(mr), 0, buf);
+	if (ret) {
+		printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
+		goto err;
+	}
+
 	do {
-		ret = fi_cq_read(rcq, &comp, 1);
+		ret = fi_cq_readfrom(rcq, &comp, sizeof comp, &rem_addr);
 		if (ret < 0) {
-			printf("fi_cq_read rcq %d (%s)\n", ret, fi_strerror(-ret));
+			printf("fi_cq_readfrom rcq %d (%s)\n", ret, fi_strerror(-ret));
 			return ret;
 		}
 	} while (ret == 0);
 
-	ret = fi_av_insert(av, buf_ptr, 1, &rem_addr, 0, NULL);
-	if (ret != 1) {
-		if (ret == 0) {
-			printf("Unable to resolve remote address 0x%x 0x%x\n",
-					((uint32_t *)buf)[0], ((uint32_t *)buf)[1]);
-			ret = -FI_EINVAL;
-		} else {
-			printf("fi_insert_av %d (%s)\n", ret, fi_strerror(-ret));
-		}
+	if (rem_addr == FI_ADDR_NOTAVAIL) {
+		printf("Error getting address\n");
 		goto err;
 	}
 
+/*
 	ret = fi_recv(ep, buf, buffer_size, fi_mr_desc(mr), 0, buf);
 	if (ret != 0) {
 		printf("fi_recv %d (%s)\n", ret, fi_strerror(-ret));
 		goto err;
 	}
+*/
 
 	ret = send_xfer(4);
 	if (ret != 0)
@@ -492,7 +769,8 @@ err:
 
 static int run(void)
 {
-	int i, ret = 0;
+	int i;
+	int ret = 0;
 
 	ret = dst_addr ? client_connect() : server_connect();
 	if (ret)
@@ -501,14 +779,17 @@ static int run(void)
 	if (!custom) {
 		for (i = 0; i < TEST_CNT; i++) {
 			if (test_size[i].option > size_option ||
-				(max_msg_size && test_size[i].size > max_msg_size)) {
+				(max_msg_size && test_size[i].size * iov_count
+					> max_msg_size)) {
 				continue;
 			}
 			init_test(test_size[i].size, test_name, &transfer_size, &iterations);
-			run_test();
+			ret = run_test();
+			if (ret)
+				break;
 		}
-	} else {
-
+	}
+	else {
 		ret = run_test();
 	}
 
@@ -532,7 +813,6 @@ static int run(void)
 	if (ret != 0) {
 		printf("fi_close(fab) ret=%d, %s\n", ret, fi_strerror(-ret));
 	}
-	fi_freeinfo(fi);
 	return ret;
 }
 
@@ -540,7 +820,7 @@ int main(int argc, char **argv)
 {
 	int op;
 
-	while ((op = getopt(argc, argv, "d:f:n:p:s:I:S:m")) != -1) {
+	while ((op = getopt(argc, argv, "d:f:n:p:s:I:S:m:i:")) != -1) {
 		switch (op) {
 		case 'd':
 			dst_addr = optarg;
@@ -558,7 +838,6 @@ int main(int argc, char **argv)
 			src_addr = optarg;
 			break;
 		case 'I':
-			custom = 1;
 			iterations = atoi(optarg);
 			break;
 		case 'S':
@@ -574,6 +853,10 @@ int main(int argc, char **argv)
 			g_argc = argc;
 			g_argv = argv;
 			break;
+		case 'i':
+			iov_count = atoi(optarg);
+			iov_count = iov_count > MAX_IOV ? MAX_IOV : iov_count;
+			break;
 		default:
 			printf("usage: %s\n", argv[0]);
 			printf("\t[-d destination_address]\n");
@@ -582,7 +865,7 @@ int main(int argc, char **argv)
 			printf("\t[-p port_number]\n");
 			printf("\t[-s source_address]\n");
 			printf("\t[-I iterations]\n");
-			printf("\t[-S transfer_size or 'all']\n");
+			printf("\t[-i number of io vectors for each send/recv]\n");
 			printf("\t[-m machine readable output]\n");
 			exit(1);
 		}
